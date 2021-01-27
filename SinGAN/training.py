@@ -7,6 +7,23 @@ import torch.utils.data
 import math
 import matplotlib.pyplot as plt
 from SinGAN.imresize import imresize
+import nvidia_smi
+import datetime
+import pickle as pk
+
+full_memory = []
+full_time = []
+timestamp = [datetime.datetime.now()]
+
+def memory_check():
+    nvidia_smi.nvmlInit()
+    handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)
+    # card id 0 hardcoded here, there is also a call to get all available card ids, so we could iterate
+
+    mem_res = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
+    mbs = mem_res.used/(1024**2)
+    percent = mem_res.used/mem_res.total
+    return mbs, percent
 
 def train(opt,Gs,Zs,reals,NoiseAmp):
     real_ = functions.read_image(opt)
@@ -16,6 +33,8 @@ def train(opt,Gs,Zs,reals,NoiseAmp):
     reals = functions.creat_reals_pyramid(real,reals,opt)
     nfc_prev = 0
 
+    memory = [] ##storing memory
+    time = [] ##storing time
     while scale_num<opt.stop_scale+1:
         opt.nfc = min(opt.nfc_init * pow(2, math.floor(scale_num / 4)), 128)
         opt.min_nfc = min(opt.min_nfc_init * pow(2, math.floor(scale_num / 4)), 128)
@@ -35,9 +54,13 @@ def train(opt,Gs,Zs,reals,NoiseAmp):
         if (nfc_prev==opt.nfc):
             G_curr.load_state_dict(torch.load('%s/%d/netG.pth' % (opt.out_,scale_num-1)))
             D_curr.load_state_dict(torch.load('%s/%d/netD.pth' % (opt.out_,scale_num-1)))
-
-        z_curr,in_s,G_curr = train_single_scale(D_curr,G_curr,reals,Gs,Zs,in_s,NoiseAmp,opt)
-
+        start = datetime.datetime.now()
+        z_curr,in_s,G_curr, mbs, percent = train_single_scale(D_curr,G_curr,reals,Gs,Zs,in_s,NoiseAmp,opt)
+        memory.append([mbs, percent])
+        end = datetime.datetime.now()
+        elapsed = end - start
+        time.append(elapsed)
+        print(f'time: {elapsed}')
         G_curr = functions.reset_grads(G_curr,False)
         G_curr.eval()
         D_curr = functions.reset_grads(D_curr,False)
@@ -51,10 +74,19 @@ def train(opt,Gs,Zs,reals,NoiseAmp):
         torch.save(Gs, '%s/Gs.pth' % (opt.out_))
         torch.save(reals, '%s/reals.pth' % (opt.out_))
         torch.save(NoiseAmp, '%s/NoiseAmp.pth' % (opt.out_))
+        torch.save(full_memory, '%s/full_memory.pth' % (opt.out_))
+        torch.save(full_time, '%s/full_time.pth' % (opt.out_))
 
         scale_num+=1
         nfc_prev = opt.nfc
         del D_curr,G_curr
+    #torch.save(full_memory, '%s/full_memory.pk' % (opt.out_))
+    #torch.save(full_time, '%s/full_time.pk' % (opt.out_))
+    print(memory)
+    print(time)
+    print(full_memory)
+    print(full_time)
+    #pk.dump(full_memory, open('Full_memory', 'wb'))
     return
 
 
@@ -93,6 +125,7 @@ def train_single_scale(netD,netG,reals,Gs,Zs,in_s,NoiseAmp,opt,centers=None):
     z_opt2plot = []
 
     for epoch in range(opt.niter):
+
         if (Gs == []) & (opt.mode != 'SR_train'):
             z_opt = functions.generate_noise([1,opt.nzx,opt.nzy], device=opt.device)
             z_opt = m_noise(z_opt.expand(1,3,opt.nzx,opt.nzy))
@@ -196,8 +229,18 @@ def train_single_scale(netD,netG,reals,Gs,Zs,in_s,NoiseAmp,opt,centers=None):
         D_fake2plot.append(D_G_z)
         z_opt2plot.append(rec_loss)
 
+
+
         if epoch % 25 == 0 or epoch == (opt.niter-1):
-            print('scale %d:[%d/%d]' % (len(Gs), epoch, opt.niter))
+            
+            stamp = datetime.datetime.now()
+            timestamp.append(stamp)
+
+            delta = (timestamp[-1] - timestamp[-2]).seconds
+            mbs, percent = memory_check()
+            print('scale %d:[%d/%d] | Mb: %.3f | Percent %.3f | secs %.3f ' % (len(Gs), epoch, opt.niter, mbs, 100*percent, delta))
+            full_memory.append([mbs,percent])
+            full_time.append(delta)
 
         if epoch % 500 == 0 or epoch == (opt.niter-1):
             plt.imsave('%s/fake_sample.png' %  (opt.outf), functions.convert_image_np(fake.detach()), vmin=0, vmax=1)
@@ -216,7 +259,17 @@ def train_single_scale(netD,netG,reals,Gs,Zs,in_s,NoiseAmp,opt,centers=None):
         schedulerG.step()
 
     functions.save_networks(netG,netD,z_opt,opt)
-    return z_opt,in_s,netG    
+
+    nvidia_smi.nvmlInit()
+    handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)
+    # card id 0 hardcoded here, there is also a call to get all available card ids, so we could iterate
+
+    mem_res = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
+    mbs = mem_res.used/(1024**2)
+    percent = mem_res.used/mem_res.total
+    print(f'mem: {mem_res.used / (1024**2)} (GiB)') # usage in GiB
+    print(f'mem: {100 * (mem_res.used / mem_res.total):.6f}%') # percentage
+    return z_opt,in_s,netG, mbs, percent    
 
 def draw_concat(Gs,Zs,reals,NoiseAmp,in_s,mode,m_noise,m_image,opt):
     G_z = in_s
